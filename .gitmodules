@@ -1,0 +1,3 @@
+[submodule "mcps/pdf-reader-mcp"]
+	path = mcps/pdf-reader-mcp
+	url = https://github.com/averagejoeslab/pdf-reader-mcp.git

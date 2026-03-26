@@ -1,0 +1,54 @@
+Metadata-Version: 2.4
+Name: lygent-auto-researcher
+Version: 0.1.0
+Summary: LangGraph-based research agent with planning, research, writing, and critique loop.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: langgraph>=0.2.0
+Requires-Dist: langchain-core>=0.3.0
+Requires-Dist: langchain-openai>=0.2.0
+Requires-Dist: langchain-community>=0.3.0
+Requires-Dist: pydantic>=2.7.0
+Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: duckduckgo-search>=6.2.0
+Requires-Dist: mcp>=1.0.0
+
+📋 Project Context for LLM Assistants: Auto-Researcher Agent
+1. Project Overview & Objective
+
+Project Name: Auto-Researcher Agent
+
+Primary Goal: To build a comprehensive, production-ready Single-Agent system from scratch, utilizing a state-machine workflow. This project serves as an interview preparation showcase for Generative AI engineering roles.
+
+Application Domain: Automated academic literature review and technical research. Specifically, the agent will autonomously research the application of multi-agent systems in social simulation and educational settings, categorizing methodologies by technical approaches (e.g., Prompt Engineering, Fine-Tuning, Reinforcement Learning).
+
+2. Core Tech Stack
+
+Language: Python (Strict typing preferred for state management)
+
+Agentic Framework: LangChain & LangGraph (Moving away from legacy AgentExecutor to graph-based state machines)
+
+Vector Database (Knowledge Base): PostgreSQL paired with the pgvector extension (for both structured metadata and dense vector storage).
+
+Tooling Protocol: MCP (Model Context Protocol) for integrating external APIs.
+
+LLM Backend: Agnostic (OpenAI/Anthropic/Gemini compatible via LangChain standard interfaces).
+
+3. Architecture & Core Modules
+The agent operates on a continuous loop defined by a LangGraph Directed Acyclic Graph (DAG), incorporating the following modules:
+
+State Management (Memory): A centralized TypedDict tracking the user's initial query, intermediate planning steps, collected documents, execution history, and short-term memory window.
+
+Planner Node (Task Decomposition): Analyzes the complex query and generates a sequential list of sub-tasks (e.g., 1. Query Local DB -> 2. Search arXiv via MCP -> 3. Extract tech stack -> 4. Synthesize).
+
+RAG / Knowledge Node: Connects to the local PostgreSQL/pgvector instance. Vectorizes queries to retrieve highly relevant chunks from existing local literature/notes.
+
+Action / Tool Node (MCP Integration): Acts as an MCP Client. Dynamically calls local or remote MCP Servers (e.g., Web Search, arXiv API) when the Planner determines external data is needed.
+
+Critic / Reflection Node: Evaluates the drafted output against the initial prompt. If the output hallucinates, lacks specific categorization (e.g., missing the Prompt/FT/RL breakdown), or has dead citations, it generates a critique and routes the state back to the Planner/Action nodes for self-correction.
+
+4. Current Task & Coding Guidelines
+
+Code Style: Modular, heavily commented (explaining the why for interview prep), and focused on robust error handling.
+
+Next Immediate Step: We are currently at Phase 1: Defining the core LangGraph AgentState schema and setting up the fundamental nodes (Planner, Execute, Reflect) before wiring up the PostgreSQL database and MCP protocols. Please maintain this architectural vision in all generated code.
