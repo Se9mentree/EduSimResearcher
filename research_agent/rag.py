@@ -1,4 +1,5 @@
 import hashlib
+import re
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -16,6 +17,11 @@ from research_agent.config import (
 
 _VECTOR_STORE = None
 _TEXT_SPLITTER = None
+
+
+def _normalize_for_hash(text: str) -> str:
+    # Conservative normalization: collapse whitespace only, avoid semantic changes.
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _get_text_splitter() -> RecursiveCharacterTextSplitter:
@@ -101,16 +107,22 @@ def _build_documents_for_paper(paper: Dict[str, Any]) -> List[Document]:
     blocks = _build_blocks(paper)
     docs: List[Document] = []
     chunk_index = 0
+    seen_chunk_hashes = set()
 
     for block in blocks:
         section_name = block["section"]
         block_text = block["text"]
         for chunk in splitter.split_text(block_text):
-            if not chunk.strip():
+            cleaned_chunk = chunk.strip()
+            if not cleaned_chunk:
                 continue
+            chunk_hash = hashlib.sha1(_normalize_for_hash(cleaned_chunk).encode("utf-8")).hexdigest()
+            if chunk_hash in seen_chunk_hashes:
+                continue
+            seen_chunk_hashes.add(chunk_hash)
             docs.append(
                 Document(
-                    page_content=chunk.strip(),
+                    page_content=cleaned_chunk,
                     metadata={
                         "paper_id": paper_id,
                         "title": title,
