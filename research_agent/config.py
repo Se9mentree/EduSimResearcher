@@ -12,6 +12,11 @@ AGENT_REQUIREMENTS_PATH = BASE_DIR / "agent要求.md"
 
 MAX_REVISIONS = int(os.getenv("MAX_REVISIONS", "2"))
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
+RAG_CHUNK_SIZE = int(os.getenv("RAG_CHUNK_SIZE", "1200"))
+RAG_CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", "200"))
+VECTOR_DB_DIR = os.getenv("VECTOR_DB_DIR", str(BASE_DIR / "data" / "vector_db"))
+VECTOR_DB_COLLECTION = os.getenv("VECTOR_DB_COLLECTION", "papers")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 
 PDF_READER_MCP_SSE_URL = os.getenv("PDF_READER_MCP_SSE_URL", "http://localhost:8000/sse")
 PDF_PARSE_TIMEOUT_SEC = int(os.getenv("PDF_PARSE_TIMEOUT_SEC", "60"))
