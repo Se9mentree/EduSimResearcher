@@ -1,6 +1,8 @@
 from langchain_core.tools import tool
 
+from research_agent.config import RAG_TOP_K
 from research_agent.paper_parser import run_pdf_reader_capability_result
+from research_agent.rag import retrieve_related_papers
 
 
 def _format_capability_result(paper_path: str, capability: str) -> str:
@@ -45,10 +47,30 @@ def extract_citations_tool(paper_path: str) -> str:
     return _format_capability_result(paper_path, "extract-citations")
 
 
+@tool
+def rag_search_tool(query: str, top_k: int = RAG_TOP_K, input_paper: str = "") -> str:
+    """用于检索本地向量库中的相关论文片段。返回带分数和来源信息的命中列表；若检索失败会返回错误前缀。"""
+    search_query = (query or "").strip()
+    if not search_query:
+        return "[MCP_WARN] empty_query capability=rag-search"
+
+    hits = retrieve_related_papers(
+        query=search_query,
+        input_paper=(input_paper or "").strip(),
+        top_k=top_k,
+    )
+    if not hits:
+        return "[MCP_WARN] empty_content capability=rag-search"
+    if len(hits) == 1 and hits[0].startswith("[RAG_ERROR]"):
+        return f"[MCP_ERROR] capability=rag-search error={hits[0]}"
+    return "\n\n".join(hits)
+
+
 RESEARCHER_TOOLS = [
     extract_academic_text_tool,
     extract_abstract_tool,
     detect_sections_tool,
     extract_key_sections_tool,
     extract_citations_tool,
+    rag_search_tool,
 ]
