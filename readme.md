@@ -16,6 +16,8 @@
 
 固定输出要求由 [agent要求.md](./agent要求.md) 驱动，`writer` 和 `critic` 都会显式消费该文档。
 
+架构主说明（建议先读）：[docs/architecture_progressive_guide.md](./docs/architecture_progressive_guide.md)
+
 ## 当前能力边界
 
 已实现：
@@ -44,6 +46,7 @@ Lygent/
 ├─ auto_researcher.py                # CLI 入口：传入论文路径并启动 workflow
 ├─ agent要求.md                      # 最终输出规范（writer/critic 的核心约束）
 ├─ docs/
+│  ├─ architecture_progressive_guide.md  # 架构主文档（全局->局部，agent 渐进式阅读）
 │  └─ pdf_reader_mcp_setup.md        # MCP 启动与排错文档
 ├─ mcps/
 │  └─ pdf-reader-mcp/                # 本地 PDF MCP server
@@ -54,7 +57,13 @@ Lygent/
    ├─ paper_parser.py                # MCP client + 解析适配层（核心）
    ├─ rag.py                         # Chroma RAG 入库与检索
    ├─ tools.py                       # researcher 可调用的 PDF-MCP 工具
-   ├─ nodes.py                       # paper_ingest/planner/researcher/writer/critic
+   ├─ nodes.py                       # 兼容导出层（保持旧导入路径）
+   ├─ nodes_common.py                # 公共 helper / 门槛工具函数
+   ├─ nodes_ingest_planner.py        # ingest + planner
+   ├─ nodes_researcher.py            # researcher(ReAct)
+   ├─ nodes_writer.py                # writer
+   ├─ nodes_critic.py                # critic + reflection_router
+   ├─ nodes_impl.py                  # 节点实现主文件（重构后实现层）
    └─ workflow.py                    # LangGraph 编排与路由
 ```
 
@@ -109,10 +118,16 @@ flowchart LR
 
 [research_agent/nodes.py](./research_agent/nodes.py)
 
+当前采用“模块拆分 + 兼容导出”：
+- `nodes.py` 只负责兼容导出（`workflow` 仍按旧路径导入）
+- 各节点按职责拆分到 `nodes_ingest_planner.py / nodes_researcher.py / nodes_writer.py / nodes_critic.py`
+- `nodes_common.py` 存放通用 helper
+
+业务角色不变：
 - `paper_ingest_node`：读 PDF 并写回 state
 - `planner_node`：基于当前论文拆分 3-4 步计划
 - `researcher_node`：调用 PDF-MCP 工具提取论文证据 + Chroma RAG 召回
-  - 仅将成功工具输出写入 `documents` 作为证据池，工具错误/空内容不会进入证据文档
+  - 仅将成功工具输出写入证据池，工具错误/空内容不会进入证据文档
 - `writer_node`：按 `agent要求.md` 生成研究分析草稿
 - `critic_node`：结构化审稿并决定下一跳
 
@@ -212,8 +227,8 @@ env -u all_proxy -u http_proxy -u https_proxy NO_PROXY=localhost,127.0.0.1 \
 
 ### 批量入库工具（调用 pdf-reader-mcp）
 
-新增脚本：`scripts/ingest_papers.py`  
-功能：支持本地 PDF、目录、URL 链接、txt 列表（每行一个路径或链接）自动解析并入库。
+脚本：`scripts/db_manager.py`  
+功能：统一的 Chroma 管理入口（`ingest/search/list/stats/delete/clear`），支持本地 PDF、目录、URL、txt 列表自动解析入库。
 
 先启动 MCP：
 ```bash
@@ -224,19 +239,19 @@ uv run pdf-reader
 再执行入库：
 ```bash
 cd /Users/a/Documents/Program/Lygent
-.venv/bin/python scripts/ingest_papers.py \
+.venv/bin/python scripts/db_manager.py ingest \
   "/absolute/path/to/paper1.pdf" \
   "https://arxiv.org/pdf/1706.03762.pdf"
 ```
 
 目录批量入库：
 ```bash
-.venv/bin/python scripts/ingest_papers.py "/absolute/path/to/pdf_dir" --recursive
+.venv/bin/python scripts/db_manager.py ingest "/absolute/path/to/pdf_dir" --recursive
 ```
 
 入库后检索验证：
 ```bash
-.venv/bin/python scripts/ingest_papers.py "/absolute/path/to/pdf_dir" --recursive \
+.venv/bin/python scripts/db_manager.py ingest "/absolute/path/to/pdf_dir" --recursive \
   --query "multi-agent education simulation" --top-k 5
 ```
 
@@ -250,5 +265,6 @@ cd /Users/a/Documents/Program/Lygent
 
 ## 参考文档
 
+- 架构主文档（全局->局部）：[docs/architecture_progressive_guide.md](./docs/architecture_progressive_guide.md)
 - PDF MCP 安装与运行：[docs/pdf_reader_mcp_setup.md](./docs/pdf_reader_mcp_setup.md)
 - 输出规范与研究目标：[agent要求.md](./agent要求.md)
