@@ -3,6 +3,16 @@
 > 本文档是项目架构解释的**唯一入口**，按 `L0 -> L1 -> L2 -> L3` 由浅入深组织。  
 > 适合 agent 分段读取并按需下钻（progressive disclosure）。
 
+## 维护约定（必须遵守）
+
+- 所有对项目的结构性改动，必须同步记录到本文档的[附录 E 改动历史](#附录-e-改动历史按迭代维护)。
+- 每次开始阅读项目代码前，优先按“先文档后代码”顺序：
+  1. `L0 全局概览`（确认当前系统边界）
+  2. `L1 运行路径`（确认执行链与状态流）
+  3. `L2 模块地图`（定位目标模块）
+  4. 再打开具体源码文件
+- 若文档与代码不一致，以代码为准，并立即回写文档修正差异。
+
 ## 快速索引
 
 - [L0 全局概览](#l0-全局概览)
@@ -13,6 +23,7 @@
 - [附录 B ReAct 与 Critic 判定语义](#附录-b-react-与-critic-判定语义)
 - [附录 C RAG 设计与限制](#附录-c-rag-设计与限制)
 - [附录 D MCP 接入契约](#附录-d-mcp-接入契约)
+- [附录 E 改动历史（按迭代维护）](#附录-e-改动历史按迭代维护)
 - [按问题跳转](#按问题跳转)
 
 ---
@@ -21,6 +32,10 @@
 
 ### 一句话目标
 把“读取论文 -> 证据提取 -> 写作 -> 审稿 -> 修订”做成可追踪、可回路的研究工作流（research workflow）。
+
+### 功能模式（并列能力）
+- `single_paper`：分析单篇论文（PDF + MCP + RAG补充）。
+- `topic_synthesis`：不依赖单篇输入，直接基于本地RAG语料库总结方向切入点。
 
 ### 系统边界
 - 输入：一篇 PDF（本地路径）+ 用户 query。
@@ -48,7 +63,7 @@ flowchart LR
 
 ### 执行链
 `auto_researcher.py` 负责：
-1. 解析 CLI 参数（论文路径 + query）。
+1. 解析 CLI 参数（`mode + query + paper_path(optional)`）。
 2. 构建初始 `AgentState`。
 3. 调用 `workflow.app.stream(...)` 逐节点执行。
 4. 汇总状态并写出最终报告到 `outputs/`。
@@ -66,6 +81,18 @@ flowchart LR
   - `researcher`：补证据
   - `writer`：改表达/结构
   - `finish`：结束（包括通过和带风险结束）
+
+说明：
+- `single_paper`：`paper_ingest` 真实解析 PDF。
+- `topic_synthesis`：`paper_ingest` 跳过单篇解析并直接进入规划。
+
+### 代码阅读建议路径（按问题下钻）
+- CLI/报告输出问题：先看 `auto_researcher.py`，再看 `workflow.py`
+- 论文读取/MCP 问题：先看 `paper_parser.py`，再看 `nodes_ingest_planner.py`
+- 取证/ReAct 问题：先看 `nodes_researcher.py`（兼容入口在 `nodes.py`）
+- 写作质量问题：先看 `nodes_writer.py`
+- 审稿/路由问题：先看 `nodes_critic.py`
+- RAG 入库/检索问题：先看 `rag.py`，批量操作再看 `scripts/db_manager.py`
 
 ---
 
@@ -301,6 +328,69 @@ MCP parse error: ExceptionGroup: unhandled errors in a TaskGroup ...
 
 ---
 
+## 附录 E 改动历史（按迭代维护）
+
+> 说明：本节记录“影响架构/流程/契约”的改动，不记录纯格式微调。
+
+### E1. 基线闭环建立（planner -> researcher -> writer -> critic）
+- 建立 LangGraph 主流程与修订循环。
+- 增加 `paper_ingest` 作为入口节点，解析失败直接终止（fail-fast）。
+
+### E2. PDF-MCP 全链路接入
+- `paper_parser.py` 作为 MCP client + adapter，统一解析 `content/structuredContent/text`。
+- 标准化 5 类能力：`extract-academic-text / extract-abstract / detect-sections / extract-key-sections / extract-citations`。
+- 增加工具别名兼容（`-` 与 `_`）。
+
+### E3. 研究工具重构（去联网搜索，转论文内证据）
+- 移除 DuckDuckGo 搜索路径。
+- researcher 改为优先调用 PDF-MCP 工具，RAG 作为本地文献补充。
+- 工具错误与空结果不再污染 `documents` 证据池。
+
+### E4. RAG 落地（Chroma）
+- `rag.py` 提供入库 `upsert_paper_to_vector_db` 与检索 `retrieve_related_papers`。
+- 切块策略：`RecursiveCharacterTextSplitter` + chunk hash 去重。
+- 元数据策略：`paper_id/title/source_path/section/chunk_index`，支持来源追踪。
+- 增加 `scripts/db_manager.py`，统一 `ingest/search/list/stats/delete/clear`。
+
+### E5. Researcher ReAct 化与止损
+- researcher 从单次调用改为多步 `Thought -> Action -> Observation`。
+- 增加 `react_trace / react_step_count / react_stop_reason` 可观测字段。
+- 加入重复动作、低信息增益、错误阈值等停止规则，降低无效循环。
+
+### E6. Critic 门槛化与结束语义修复
+- 引入硬门槛/软门槛分级，区分阻塞失败与改进建议。
+- 统一结束态：`pass | pass_with_warnings | fail | finish_with_risks`。
+- 增加能力阻塞通道 `blocked_by_capability`，避免能力缺失被误判为写作失败。
+- 建议分流为 `critic_actions_for_researcher` 与 `critic_actions_for_writer`。
+
+### E7. 节点模块化重构（第二轮）
+- 拆分节点实现为 `nodes_common / nodes_ingest_planner / nodes_researcher / nodes_writer / nodes_critic`。
+- 保留 `nodes.py` 兼容导出层，确保 `workflow` 与外部调用不破坏。
+
+### E8. 文档体系重构
+- 新增本主文档，采用 `L0-L3 + 附录` 渐进式结构。
+- README 增加主文档入口，作为“先读文档再读代码”的默认路径。
+
+### E9. 最近改动（当前迭代）
+- `auto_researcher.py` 增加可选参数 `--add-to-rag {y,n}`（默认 `n`），支持运行后按状态将当前论文入库。
+- 最终报告头部新增 `RAG入库状态`。
+- `paper_parser.py` 增加“从 MCP 全文抽取论文标题”逻辑，输出标题优先使用解析标题，失败才回退文件名。
+- `nodes_impl.py` 在 `writer_node` 增加标题后处理：无论模型如何生成，最终草稿中的“论文题目”行都会强制对齐 `input_paper_title`。
+
+### E10. 新增并列功能：`topic_synthesis`
+- `AgentState` 增加 `mode` 字段，支持 `single_paper | topic_synthesis`。
+- `auto_researcher.py` 增加 `--mode` 参数：
+  - `single_paper` 必须传入 `paper_path`
+  - `topic_synthesis` 可不传 `paper_path`
+- `paper_ingest_node` 在 `topic_synthesis` 下跳过单篇解析，避免错误阻塞。
+- `researcher_node` 增加方向综述分支：
+  - 先调用 `rag_corpus_overview_tool` 获取语料全局覆盖
+  - 再按固定切入轴调用 `rag_search_tool` 聚合证据
+- `writer_node` 增加方向综述写作分支（输出“主要切入点 + 方向地图 + future directions”）。
+- `critic_node` 增加方向综述审稿分支，核心检查“跨论文覆盖度（unique_titles）+证据标注密度”。
+
+---
+
 ## 按问题跳转
 
 - 如何判断“为什么未通过审稿”？  
@@ -322,4 +412,3 @@ MCP parse error: ExceptionGroup: unhandled errors in a TaskGroup ...
 - 安装与排错：[`docs/pdf_reader_mcp_setup.md`](./pdf_reader_mcp_setup.md)
 - 面试表达模板：[`docs/mas_interview_qa.md`](./mas_interview_qa.md)
 - 输出约束源文档：[`agent要求.md`](../agent要求.md)
-

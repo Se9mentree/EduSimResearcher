@@ -2,6 +2,10 @@
 
 一个基于 LangGraph 的研究型 Agent 项目，目标是围绕“教育模拟 + 多智能体 + 社会行为机制”完成从论文读取、研究规划、检索、写作到批判反思的闭环。
 
+当前支持两个并列功能模式：
+- `single_paper`：分析单篇论文（默认）
+- `topic_synthesis`：基于本地 RAG 语料库总结方向切入点
+
 当前版本重点是：
 - 通过 `pdf-reader-mcp` 读取 PDF 论文并结构化入状态。
 - 运行 `planner -> researcher -> writer -> critic` 的反思循环。
@@ -189,6 +193,23 @@ cd /Users/a/Documents/Program/Lygent
 说明：
 - 当前 CLI 采用“位置参数传论文路径”。
 - `--query` 仍可选，用于覆盖默认研究问题。
+- `--mode` 可选：
+  - `single_paper`（默认）：必须传 `paper_path`
+  - `topic_synthesis`：可不传 `paper_path`
+
+单篇分析示例：
+```bash
+.venv/bin/python auto_researcher.py "/absolute/path/to/paper.pdf" \
+  --mode single_paper \
+  --query "请分析这篇论文并结合我的研究方向推进研究"
+```
+
+方向综述示例（基于 RAG 语料库）：
+```bash
+.venv/bin/python auto_researcher.py \
+  --mode topic_synthesis \
+  --query "请基于RAG中的所有文章总结agent simulation方向的主要论文切入点"
+```
 
 ## 常见问题排查
 

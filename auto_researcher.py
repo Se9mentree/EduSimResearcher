@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
+from research_agent.rag import upsert_paper_to_vector_db
 from research_agent.state import build_initial_state
 from research_agent.workflow import app
 
@@ -17,7 +18,7 @@ LIST_APPEND_FIELDS = {
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run the Auto-Researcher workflow with a PDF paper.")
+    parser = argparse.ArgumentParser(description="Run the Auto-Researcher workflow.")
     parser.add_argument(
         "paper_path",
         nargs="?",
@@ -28,6 +29,18 @@ def parse_args():
         "--query",
         default="请分析这篇论文并结合我的研究方向推进研究",
         help="User research query.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("single_paper", "topic_synthesis"),
+        default="single_paper",
+        help="single_paper: analyze one input PDF; topic_synthesis: summarize entry points from RAG corpus.",
+    )
+    parser.add_argument(
+        "--add-to-rag",
+        choices=("y", "n"),
+        default="n",
+        help="Whether to upsert the current paper into local RAG vector DB (y/n).",
     )
     return parser.parse_args()
 
@@ -41,11 +54,50 @@ def merge_state(current_state: Dict[str, Any], state_update: Dict[str, Any]) -> 
     return current_state
 
 
+def maybe_upsert_current_paper_to_rag(state: Dict[str, Any], enabled: bool) -> str:
+    if not enabled:
+        return "disabled"
+    if str(state.get("mode", "single_paper")).strip().lower() != "single_paper":
+        return "skipped: mode_not_single_paper"
+
+    paper_path = str(state.get("paper_path", "")).strip()
+    if not paper_path:
+        return "skipped: empty_paper_path"
+
+    parse_status = str(state.get("input_paper_parse_status", "")).strip().lower()
+    if parse_status != "success":
+        return f"skipped: parse_status={parse_status or 'unknown'}"
+
+    payload = {
+        "paper_path": paper_path,
+        "source_path": paper_path,
+        "title": str(state.get("input_paper_title", "")).strip(),
+        "abstract": str(state.get("input_paper_abstract", "")).strip(),
+        "full_text": str(state.get("input_paper", "")).strip(),
+        "sections": state.get("input_paper_sections", {}) or {},
+        "key_sections": state.get("input_paper_key_sections", {}) or {},
+    }
+    has_content = bool(payload["abstract"] or payload["full_text"] or payload["sections"] or payload["key_sections"])
+    if not has_content:
+        return "skipped: empty_parsed_content"
+
+    try:
+        upsert_paper_to_vector_db(payload)
+    except Exception as e:
+        return f"failed: {type(e).__name__}: {e}"
+
+    return "success"
+
+
 def write_final_report(state: Dict[str, Any]) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    mode = str(state.get("mode", "single_paper")).strip().lower()
     raw_title = state.get("input_paper_title", "").strip()
-    if not raw_title:
+    if mode == "topic_synthesis":
+        query_part = re.sub(r"\s+", "_", str(state.get("query", "")).strip())[:80]
+        raw_title = raw_title or f"topic_synthesis_{query_part or 'agent_simulation'}"
+    elif not raw_title:
         raw_title = Path(state.get("paper_path", "")).stem.strip() or "untitled_paper"
 
     safe_title = re.sub(r'[\\/:*?"<>|]', "_", raw_title).strip().rstrip(".")
@@ -84,11 +136,13 @@ def write_final_report(state: Dict[str, Any]) -> Path:
     report_content = f"""# Auto Researcher 最终报告
 
 - 生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+- 功能模式: {state.get("mode", "single_paper")}
 - 研究主题: {state.get("query", "")}
 - 论文路径: {state.get("paper_path", "")}
 - 论文标题: {state.get("input_paper_title", "")}
 - 解析状态: {state.get("input_paper_parse_status", "")}
 - 解析说明: {state.get("input_paper_parse_notes", "")}
+- RAG入库状态: {state.get("rag_ingest_status", "disabled")}
 - 修订轮次: {state.get("revision_number", 0)}
 - 最终判定: {final_judgement}
 - 审稿状态: {state.get("critic_status", "")}
@@ -146,8 +200,12 @@ def write_final_report(state: Dict[str, Any]) -> Path:
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.mode == "single_paper" and not str(args.paper_path).strip():
+        raise SystemExit("single_paper 模式必须提供 paper_path。")
+
     initial_state = build_initial_state(
         query=args.query,
+        mode=args.mode,
         paper_path=args.paper_path,
     )
     final_state: Dict[str, Any] = dict(initial_state)
@@ -159,6 +217,13 @@ if __name__ == "__main__":
             merge_state(final_state, state_update)
             print(f"✅ [节点执行完毕]: {node_name}")
             print(f"   [状态更新]: {state_update}\n")
+
+    rag_ingest_status = maybe_upsert_current_paper_to_rag(final_state, enabled=(args.add_to_rag == "y"))
+    final_state["rag_ingest_status"] = rag_ingest_status
+    if args.add_to_rag == "y":
+        print(f"🗂️ [RAG入库]: {rag_ingest_status}")
+    else:
+        print("🗂️ [RAG入库]: disabled")
 
     report_path = write_final_report(final_state)
     print(f"📄 最终报告已写入: {report_path}")

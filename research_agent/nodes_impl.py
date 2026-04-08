@@ -178,6 +178,31 @@ def _dedupe_limit_items(items: List[str], limit: int, max_per_key: int = 1) -> L
     return _limit_items(_dedupe_by_normalized_key(items, max_per_key=max_per_key), limit)
 
 
+def _enforce_paper_title_line(draft: str, paper_title: str) -> str:
+    """Force the '论文题目' line to use parsed paper title, reducing writer drift."""
+    text = str(draft or "")
+    title = str(paper_title or "").strip()
+    if not text.strip() or not title:
+        return text
+
+    canonical_line = f"- 论文题目：{title}"
+    pattern = re.compile(
+        r"(?m)^\s*-\s*(?:\*\*)?\s*论文题目\s*(?:\*\*)?\s*[:：].*$"
+    )
+
+    if pattern.search(text):
+        return pattern.sub(canonical_line, text, count=1)
+
+    # If the section header exists but title line is missing, inject deterministically.
+    header_pattern = re.compile(r"(?m)^([#*\s]*一、基本信息[^\n]*\n)")
+    match = header_pattern.search(text)
+    if match:
+        insert_at = match.end()
+        return text[:insert_at] + "\n" + canonical_line + "\n" + text[insert_at:]
+
+    return canonical_line + "\n\n" + text
+
+
 def _split_critic_failed_gates(failed_gates: List[str]) -> Dict[str, List[str]]:
     hard = []
     soft = []
@@ -292,6 +317,23 @@ def _compute_rag_hit_stats(retrieved_papers: List[str], rag_context: str) -> Dic
     total_hits = len(chunks)
     relevant_hits = sum(1 for chunk in chunks if _is_education_multiagent_relevant(chunk))
     return {"total_hits": total_hits, "relevant_hits": relevant_hits}
+
+
+def _is_topic_synthesis_mode(state: AgentState) -> bool:
+    return str(state.get("mode", "single_paper")).strip().lower() == "topic_synthesis"
+
+
+def _extract_titles_from_rag_text(text: str) -> List[str]:
+    titles = []
+    for line in str(text or "").splitlines():
+        if " title=" in line:
+            # Matches both [RAG#] ... title=... section=... and [RAG_PAPER#] ... title=... chunks=...
+            match = re.search(r"title=(.+?)\s+(?:section=|chunks=|source=)", line)
+            if match:
+                candidate = match.group(1).strip()
+                if candidate:
+                    titles.append(candidate)
+    return _dedupe_keep_order(titles)
 
 
 def _split_actions_for_roles(
@@ -876,6 +918,21 @@ def _rewrite_rag_query(
 
 
 def paper_ingest_node(state: AgentState):
+    mode = str(state.get("mode", "single_paper")).strip().lower()
+    if mode == "topic_synthesis":
+        print("[Paper Ingest Node] Topic synthesis mode: skip single-paper ingest.")
+        return {
+            "input_paper_title": "RAG Corpus",
+            "input_paper": "",
+            "input_paper_abstract": "",
+            "input_paper_sections": {},
+            "input_paper_key_sections": {},
+            "input_paper_parse_status": "success",
+            "input_paper_parse_notes": "Topic synthesis mode: paper ingest skipped.",
+            "current_step": "paper_ingest",
+            "working_memory": "Topic synthesis mode enabled. Proceeding without single-paper ingest.",
+        }
+
     print("[Paper Ingest Node] Loading and parsing paper via MCP.")
     paper_path = state.get("paper_path", "").strip()
     if not paper_path:
@@ -907,13 +964,29 @@ def paper_ingest_router(state: AgentState):
 
 
 def planner_node(state: AgentState):
+    mode = str(state.get("mode", "single_paper")).strip().lower()
     query = state["query"]
     input_paper_title = state.get("input_paper_title", "")
     input_paper_abstract = state.get("input_paper_abstract", "")
     paper_context = _build_paper_context(state)
     structured_planner_llm = get_llm().with_structured_output(PlannerOutput)
 
-    prompt = f"""你是学术研究任务拆解专家。你需要输出可执行计划而不是宏观综述。
+    if mode == "topic_synthesis":
+        prompt = f"""你是研究综述任务拆解专家。当前任务不是单篇论文分析，而是基于本地RAG论文库做方向综述。
+目标：总结“agent simulation”方向的主要论文切入点（entry points）。
+
+用户研究主题: {query}
+模式: topic_synthesis
+
+输出要求：
+1. 仅输出 3 到 4 个步骤。
+2. 每个步骤必须包含 goal、required_evidence、deliverable。
+3. required_evidence 必须聚焦“跨论文证据”，不能依赖单篇 paper_path。
+4. deliverable 必须包含：切入点定义、代表论文、方法特征、适用边界。
+5. 必须覆盖：方法切入点、评测切入点、场景切入点、未来方向切入点。
+"""
+    else:
+        prompt = f"""你是学术研究任务拆解专家。你需要输出可执行计划而不是宏观综述。
 {TOP_REQUIREMENTS_CONTRACT}
 
 用户研究主题: {query}
@@ -970,6 +1043,140 @@ def planner_node(state: AgentState):
 
 def researcher_node(state: AgentState):
     print("[Researcher Node] Executing the research step.")
+    if _is_topic_synthesis_mode(state):
+        query = state["query"]
+        plan_text = "\n".join(state.get("plan", []))
+        step_count = 0
+        evidence_idx = 1
+        evidence_cards = []
+        retrieved_papers = []
+        tool_failures = []
+        tool_traces = [
+            "mode: topic_synthesis",
+            f"rag_query_original: {_clip_text(query, 220)}",
+        ]
+        react_trace = []
+        unique_titles = set()
+
+        def add_topic_card(source_ref: str, claim: str, snippet: str, goal_ids: List[str], confidence: str):
+            nonlocal evidence_idx
+            card = {
+                "id": f"E{evidence_idx}",
+                "source_type": "rag",
+                "source_ref": source_ref,
+                "claim": claim,
+                "snippet": str(snippet or "")[:1200],
+                "goal_ids": ", ".join(goal_ids),
+                "confidence": confidence,
+                "topic": "topic_synthesis",
+                "section_hint": "rag",
+                "locator_hint": source_ref,
+                "novelty_score": 1.0,
+            }
+            evidence_cards.append(card)
+            evidence_idx += 1
+
+        corpus_tool = tool_registry.get("rag_corpus_overview_tool")
+        if corpus_tool is None:
+            tool_failures.append("rag_corpus_overview_tool: not registered")
+        else:
+            step_count += 1
+            tool_args = {"max_papers": 180, "max_chars_per_paper": 360}
+            tool_traces.append("rag_corpus_overview_tool(max_papers=180, max_chars_per_paper=360)")
+            react_trace.append(f"step-{step_count} action: rag_corpus_overview_tool args={_to_json(tool_args)}")
+            corpus_result = str(corpus_tool.invoke(tool_args))
+            if corpus_result.startswith("[MCP_ERROR]") or corpus_result.startswith("[MCP_WARN]"):
+                tool_failures.append(f"rag_corpus_overview_tool: {corpus_result}")
+                react_trace.append(f"step-{step_count} observation_error: {_clip_text(corpus_result, 320)}")
+            else:
+                react_trace.append(
+                    f"step-{step_count} observation: {_clip_text(corpus_result, 900)}"
+                )
+                retrieved_papers.append(corpus_result)
+                for title in _extract_titles_from_rag_text(corpus_result):
+                    unique_titles.add(title)
+                add_topic_card(
+                    source_ref="rag_corpus_overview_tool",
+                    claim="获取到本地RAG语料库的论文覆盖概览，可用于方向级切入点总结。",
+                    snippet=corpus_result,
+                    goal_ids=["Goal-5", "Goal-9"],
+                    confidence="high",
+                )
+
+        axis_queries = [
+            f"{query} multi-agent simulation method framework memory planning reflection",
+            f"{query} social behavior interaction mechanism evaluation benchmark",
+            f"{query} classroom education agent simulation case study empirical",
+            f"{query} future direction limitation gap education multi-agent",
+        ]
+        rag_tool = tool_registry.get("rag_search_tool")
+        if rag_tool is None:
+            tool_failures.append("rag_search_tool: not registered")
+        else:
+            for axis_idx, axis_query in enumerate(axis_queries, start=1):
+                step_count += 1
+                top_k = max(RAG_TOP_K, 10)
+                tool_traces.append(
+                    f"rag_search_tool(query={_clip_text(axis_query, 140)}, top_k={top_k})"
+                )
+                react_trace.append(
+                    f"step-{step_count} action: rag_search_tool args={_to_json({'query': axis_query, 'top_k': top_k})}"
+                )
+                rag_result = str(
+                    rag_tool.invoke(
+                        {
+                            "query": axis_query,
+                            "top_k": top_k,
+                            "input_paper": "",
+                        }
+                    )
+                )
+                if rag_result.startswith("[MCP_ERROR]") or rag_result.startswith("[MCP_WARN]"):
+                    tool_failures.append(f"rag_search_tool[{axis_idx}]: {rag_result}")
+                    react_trace.append(f"step-{step_count} observation_error: {_clip_text(rag_result, 320)}")
+                    continue
+                retrieved_papers.append(rag_result)
+                for title in _extract_titles_from_rag_text(rag_result):
+                    unique_titles.add(title)
+                add_topic_card(
+                    source_ref=f"rag_search_tool_axis_{axis_idx}",
+                    claim=f"围绕切入轴 {axis_idx} 获取到方向相关论文证据。",
+                    snippet=rag_result,
+                    goal_ids=["Goal-4", "Goal-5", "Goal-6", "Goal-9"],
+                    confidence="medium",
+                )
+                react_trace.append(
+                    f"step-{step_count} observation: {_clip_text(rag_result, 900)}"
+                )
+
+        stop_reason = "topic_synthesis_completed" if evidence_cards else "topic_synthesis_no_evidence"
+        react_trace.append(f"stop: {stop_reason}")
+        rag_context = "\n\n".join(retrieved_papers)
+        documents_from_cards = [
+            f"【证据 {card['id']}】[{card['source_type']}] {card['source_ref']} | goals={card['goal_ids']}\n{card['snippet'][:600]}\n---"
+            for card in evidence_cards
+        ]
+        tool_failures = _dedupe_limit_items(tool_failures, EVIDENCE_GAPS_TOP_N)
+        react_trace = _limit_items(react_trace, 120)
+        working_memory = (
+            "Topic synthesis researcher finished: "
+            f"steps={step_count}, evidence_cards={len(evidence_cards)}, "
+            f"unique_papers={len(unique_titles)}, tool_errors={len(tool_failures)}."
+        )
+        return {
+            "documents": documents_from_cards,
+            "evidence_cards": evidence_cards,
+            "searched_queries": tool_traces,
+            "retrieved_papers": retrieved_papers,
+            "rag_context": rag_context,
+            "evidence_gaps": tool_failures,
+            "react_step_count": step_count,
+            "react_stop_reason": stop_reason,
+            "react_trace": react_trace,
+            "working_memory": working_memory,
+            "current_step": "researcher",
+        }
+
     query = state["query"]
     plan_text = "\n".join(state.get("plan", []))
     plan_structured = state.get("plan_structured", [])
@@ -1351,6 +1558,7 @@ def researcher_node(state: AgentState):
 
 def writer_node(state: AgentState):
     print("[Writer Node] Drafting the response based on the research findings.")
+    mode = str(state.get("mode", "single_paper")).strip().lower()
     query = state["query"]
     plan_structured = state.get("plan_structured", [])
     critic = state.get("critic", "")
@@ -1361,6 +1569,54 @@ def writer_node(state: AgentState):
     paper_context = _build_paper_context(state)
     evidence_cards = state.get("evidence_cards", [])
     evidence_text = _to_json(evidence_cards)
+
+    if mode == "topic_synthesis":
+        topic_prompt = f"""你是研究方向综述写作助手。当前任务是：基于RAG论文库总结“agent simulation”方向主要论文切入点。
+要求：
+1. 只能基于给定证据卡，不得编造未出现的论文。
+2. 输出结构固定：
+   - 语料覆盖概览（论文范围、证据边界）
+   - 主要切入点（5-8条，每条含：切入点定义、代表论文、常见方法、适用场景、局限）
+   - 方向地图（按 方法/评测/场景 三个维度）
+   - 未来研究机会（3-5条）
+3. 每条关键结论必须标注 evidence id（如 [E1]）。
+4. 对证据不足的位置显式写“资料不足，需要进一步研究”。
+5. 不要输出“✅ Goal-x/覆盖率100%”等自证文本。
+
+用户主题:
+{query}
+计划:
+{_to_json(plan_structured)}
+证据卡:
+{evidence_text if evidence_cards else "[]"}
+上一轮审稿反馈:
+{critic if critic else "无"}
+给 writer 的动作建议:
+{_to_json(critic_actions_for_writer) if critic_actions_for_writer else "[]"}
+"""
+        try:
+            topic_response = get_llm().invoke(topic_prompt)
+            topic_draft = str(topic_response.content or "").strip()
+            if not topic_draft:
+                topic_draft = "资料不足，需要进一步研究。"
+            print(f"   📝 [草稿完成]: 共生成了 {len(topic_draft)} 个字符。")
+            return {
+                "draft": topic_draft,
+                "writer_structured_draft": "topic_synthesis_mode",
+                "writer_claims": [],
+                "working_memory": f"Writer produced topic synthesis draft with {len(evidence_cards)} evidence cards.",
+                "current_step": "writer",
+            }
+        except Exception as e:
+            print(f"Error in writer_node(topic_synthesis): {e}")
+            fallback = "topic_synthesis 写作失败。资料不足，需要进一步研究。"
+            return {
+                "draft": fallback,
+                "writer_structured_draft": "topic_synthesis_mode",
+                "writer_claims": [],
+                "working_memory": fallback,
+                "current_step": "writer",
+            }
 
     structured_prompt = f"""{AGENT_REQUIREMENTS}
 {TOP_REQUIREMENTS_CONTRACT}
@@ -1466,9 +1722,10 @@ def writer_node(state: AgentState):
 
     try:
         response = get_llm().invoke(render_prompt)
-        print(f"   📝 [草稿完成]: 共生成了 {len(response.content)} 个字符。")
+        final_draft = _enforce_paper_title_line(response.content, input_paper_title)
+        print(f"   📝 [草稿完成]: 共生成了 {len(final_draft)} 个字符。")
         return {
-            "draft": response.content,
+            "draft": final_draft,
             "writer_structured_draft": writer_structured_draft,
             "writer_claims": writer_claims,
             "working_memory": f"Writer produced dual outputs with {len(writer_claims)} claims.",
@@ -1488,6 +1745,7 @@ def writer_node(state: AgentState):
 
 def critic_node(state: AgentState):
     print("[Critic Node] Reviewing the draft and providing feedback.")
+    mode = str(state.get("mode", "single_paper")).strip().lower()
     query = state["query"]
     draft = state.get("draft", "")
     writer_structured_draft = state.get("writer_structured_draft", "")
@@ -1499,6 +1757,81 @@ def critic_node(state: AgentState):
     evidence_cards = state.get("evidence_cards", [])
     rag_context_full = state.get("rag_context", "")
     current_rev = state.get("revision_number", 0)
+
+    if mode == "topic_synthesis":
+        combined_evidence_text = "\n\n".join(str(card.get("snippet", "")) for card in evidence_cards)
+        unique_titles = set(_extract_titles_from_rag_text(combined_evidence_text + "\n" + rag_context_full))
+        warnings = []
+        hard_failed_gates = []
+        soft_failed_gates = []
+        critic_actions_for_researcher = []
+        critic_actions_for_writer = []
+        evidence_gaps = []
+        blocked_by_capability = []
+
+        if not draft.strip():
+            hard_failed_gates.append("draft_empty")
+            critic_actions_for_writer.append("补写方向综述正文，至少覆盖5个切入点并标注证据ID。")
+        if len(unique_titles) < 5:
+            hard_failed_gates.append("topic_corpus_coverage")
+            critic_actions_for_researcher.append(
+                f"扩展RAG证据覆盖：当前仅识别到 {len(unique_titles)} 篇论文，目标至少 5 篇。"
+            )
+            evidence_gaps.append("方向综述的跨论文覆盖不足（unique_titles < 5）。")
+        if "[E" not in draft:
+            soft_failed_gates.append("evidence_citation_density")
+            critic_actions_for_writer.append("为关键结论补充 evidence id 标注（如 [E1]）。")
+            warnings.append("草稿证据标注密度偏低，建议补充 evidence id。")
+        if "资料不足，需要进一步研究" not in draft:
+            soft_failed_gates.append("uncertainty_disclosure")
+            critic_actions_for_writer.append("在证据不足位置显式增加“资料不足，需要进一步研究”。")
+            warnings.append("草稿缺少不确定性披露语句。")
+
+        next_step = "finish"
+        critic_status = "pass"
+        if hard_failed_gates:
+            if current_rev >= MAX_REVISIONS:
+                critic_status = "finish_with_risks"
+                next_step = "finish"
+            else:
+                critic_status = "fail"
+                next_step = "researcher" if "topic_corpus_coverage" in hard_failed_gates else "writer"
+        elif soft_failed_gates:
+            critic_status = "pass_with_warnings"
+            next_step = "finish"
+
+        score_map = {
+            "topic_corpus_coverage": 5 if len(unique_titles) >= 5 else max(0, len(unique_titles)),
+            "evidence_alignment": 5 if "[E" in draft else 2,
+            "no_hallucination": 4,
+        }
+        critic_summary = (
+            f"Topic synthesis审稿：unique_titles={len(unique_titles)}，"
+            f"hard_failed={hard_failed_gates or 'none'}，soft_failed={soft_failed_gates or 'none'}。"
+        )
+        unresolved_gaps = evidence_gaps if critic_status == "finish_with_risks" else []
+
+        return {
+            "critic": critic_summary,
+            "critic_status": critic_status,
+            "critic_next_step": next_step,
+            "critic_scores": score_map,
+            "critic_failed_gates": hard_failed_gates + soft_failed_gates,
+            "hard_failed_gates": hard_failed_gates,
+            "soft_failed_gates": soft_failed_gates,
+            "critic_actions": _dedupe_keep_order(critic_actions_for_researcher + critic_actions_for_writer),
+            "critic_actions_for_researcher": _dedupe_keep_order(critic_actions_for_researcher),
+            "critic_actions_for_writer": _dedupe_keep_order(critic_actions_for_writer),
+            "warnings": _dedupe_keep_order(warnings),
+            "unresolved_gaps": _dedupe_limit_items(unresolved_gaps, EVIDENCE_GAPS_TOP_N),
+            "blocked_by_capability": blocked_by_capability,
+            "evidence_gaps": _dedupe_limit_items(evidence_gaps, EVIDENCE_GAPS_TOP_N),
+            "revision_number": current_rev + (0 if next_step == "finish" else 1),
+            "revision_history": [critic_summary],
+            "working_memory": critic_summary,
+            "current_step": "critic",
+        }
+
     structured_critic_llm = get_llm().with_structured_output(CriticOutput)
     context_probe_llm = get_llm().with_structured_output(CriticContextNeed)
 

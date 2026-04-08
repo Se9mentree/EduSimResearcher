@@ -7,6 +7,9 @@ from langchain_core.messages import BaseMessage
 class AgentState(TypedDict):
     """State of the agent, including its memory and any relevant information."""
 
+    # 0. Workflow mode
+    mode: str
+
     # 1. User query or task description
     query: str
 
@@ -65,11 +68,13 @@ class AgentState(TypedDict):
 
 def build_initial_state(
     query: str,
+    mode: str = "single_paper",
     paper_path: str = "",
     input_paper: str = "",
     input_paper_title: str = "",
 ) -> AgentState:
     return {
+        "mode": mode,
         "query": query,
         "messages": [],
         "plan": [],

@@ -1,7 +1,7 @@
 import hashlib
 import re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -134,6 +134,106 @@ def _build_documents_for_paper(paper: Dict[str, Any]) -> List[Document]:
             )
             chunk_index += 1
     return docs
+
+
+def _section_priority(section: str) -> int:
+    key = str(section or "").lower()
+    if key in {"abstract", "key_abstract"}:
+        return 0
+    if "introduction" in key or key == "key_introduction":
+        return 1
+    if "method" in key or "experiment" in key or "result" in key:
+        return 2
+    return 3
+
+
+def _get_chroma_collection() -> Tuple[Any, Any]:
+    try:
+        import chromadb
+    except Exception as e:
+        raise RuntimeError("chromadb is required for corpus overview.") from e
+
+    Path(VECTOR_DB_DIR).mkdir(parents=True, exist_ok=True)
+    client = chromadb.PersistentClient(path=VECTOR_DB_DIR)
+    collection_names = [c.name for c in client.list_collections()]
+    if VECTOR_DB_COLLECTION not in collection_names:
+        raise RuntimeError(f"Collection [{VECTOR_DB_COLLECTION}] does not exist.")
+    collection = client.get_collection(VECTOR_DB_COLLECTION)
+    return client, collection
+
+
+def get_rag_corpus_overview(max_papers: int = 120, max_chars_per_paper: int = 420) -> List[str]:
+    try:
+        _, collection = _get_chroma_collection()
+    except Exception as e:
+        return [f"[RAG_ERROR] {type(e).__name__}: {e}"]
+
+    total_chunks = int(collection.count())
+    if total_chunks <= 0:
+        return []
+
+    batch_size = 500
+    offset = 0
+    aggregated: Dict[str, Dict[str, Any]] = {}
+
+    while offset < total_chunks:
+        batch = collection.get(
+            limit=min(batch_size, total_chunks - offset),
+            offset=offset,
+            include=["documents", "metadatas"],
+        )
+        docs = batch.get("documents", []) or []
+        metas = batch.get("metadatas", []) or []
+        if not docs and not metas:
+            break
+        for doc, meta in zip(docs, metas):
+            if not isinstance(meta, dict):
+                continue
+            paper_id = str(meta.get("paper_id", "")).strip() or "unknown"
+            title = str(meta.get("title", "")).strip() or "untitled"
+            source_path = str(meta.get("source_path", "")).strip()
+            section = str(meta.get("section", "")).strip()
+            text = str(doc or "").strip()
+
+            item = aggregated.setdefault(
+                paper_id,
+                {
+                    "paper_id": paper_id,
+                    "title": title,
+                    "source_path": source_path,
+                    "chunks": 0,
+                    "best_section": "",
+                    "best_snippet": "",
+                    "best_priority": 999,
+                },
+            )
+            item["chunks"] += 1
+
+            if text:
+                current_priority = _section_priority(section)
+                if current_priority < item["best_priority"] or not item["best_snippet"]:
+                    snippet = text[:max_chars_per_paper]
+                    item["best_priority"] = current_priority
+                    item["best_section"] = section or "unknown"
+                    item["best_snippet"] = snippet
+        offset += len(docs)
+
+    papers = sorted(
+        aggregated.values(),
+        key=lambda x: (-(int(x.get("chunks", 0))), str(x.get("title", ""))),
+    )
+    papers = papers[: max(1, int(max_papers))]
+
+    lines = [
+        f"[RAG_CORPUS] total_papers={len(aggregated)} total_chunks={total_chunks} shown={len(papers)}"
+    ]
+    for idx, paper in enumerate(papers, start=1):
+        lines.append(
+            f"[RAG_PAPER#{idx}] paper_id={paper['paper_id']} title={paper['title']} "
+            f"chunks={paper['chunks']} section={paper['best_section']} source={paper['source_path']}\n"
+            f"{paper['best_snippet']}"
+        )
+    return lines
 
 
 def retrieve_related_papers(query: str, input_paper: str, top_k: int = RAG_TOP_K) -> List[str]:

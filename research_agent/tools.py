@@ -2,7 +2,7 @@ from langchain_core.tools import tool
 
 from research_agent.config import RAG_TOP_K
 from research_agent.paper_parser import run_pdf_reader_capability_result
-from research_agent.rag import retrieve_related_papers
+from research_agent.rag import get_rag_corpus_overview, retrieve_related_papers
 
 
 def _format_capability_result(paper_path: str, capability: str) -> str:
@@ -66,6 +66,20 @@ def rag_search_tool(query: str, top_k: int = RAG_TOP_K, input_paper: str = "") -
     return "\n\n".join(hits)
 
 
+@tool
+def rag_corpus_overview_tool(max_papers: int = 120, max_chars_per_paper: int = 420) -> str:
+    """用于获取本地向量库的全库论文概览（按 paper_id 聚合）。返回每篇论文的标题、来源和代表片段，适合主题综述与方向切入点提炼。"""
+    lines = get_rag_corpus_overview(
+        max_papers=max_papers,
+        max_chars_per_paper=max_chars_per_paper,
+    )
+    if not lines:
+        return "[MCP_WARN] empty_content capability=rag-corpus-overview"
+    if len(lines) == 1 and lines[0].startswith("[RAG_ERROR]"):
+        return f"[MCP_ERROR] capability=rag-corpus-overview error={lines[0]}"
+    return "\n\n".join(lines)
+
+
 RESEARCHER_TOOLS = [
     extract_academic_text_tool,
     extract_abstract_tool,
@@ -73,4 +87,5 @@ RESEARCHER_TOOLS = [
     extract_key_sections_tool,
     extract_citations_tool,
     rag_search_tool,
+    rag_corpus_overview_tool,
 ]
