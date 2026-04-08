@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -42,6 +43,25 @@ REQUIRED_TOOL_ALIASES: Dict[str, Tuple[str, ...]] = {
     "extract-key-sections": ("extract-key-sections", "extract_key_sections"),
     "extract-citations": ("extract-citations", "extract_citations"),
 }
+
+TITLE_TRIM_MARKERS = (
+    " abstract ",
+    " 摘要 ",
+    " introduction ",
+    " keywords ",
+    " 1 introduction ",
+    " code data checkpoints ",
+)
+
+TITLE_METADATA_MARKERS = (
+    " language technologies institute ",
+    " carnegie mellon university ",
+    " university ",
+    " institute ",
+    " department ",
+    " arxiv:",
+    " doi:",
+)
 
 
 def _extract_tool_payload(result: Any) -> Tuple[str, Any]:
@@ -115,6 +135,82 @@ def _normalize_section_name(name: str) -> str:
         if key in lowered:
             return value
     return lowered.replace(" ", "_")
+
+
+def _normalize_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def _looks_like_valid_title(candidate: str) -> bool:
+    text = _normalize_ws(candidate)
+    if len(text) < 8 or len(text) > 220:
+        return False
+    if text.lower().endswith(".pdf"):
+        return False
+    if "/" in text or "\\" in text:
+        return False
+    # Filter obvious filename-like stems: "Author - 2024 - Title"
+    if re.search(r"\s-\s\d{4}\s-\s", text):
+        return False
+    words = text.split()
+    if len(words) < 3:
+        return False
+    digit_ratio = sum(ch.isdigit() for ch in text) / max(len(text), 1)
+    if digit_ratio > 0.2:
+        return False
+    return True
+
+
+def _extract_title_from_full_text(full_text: str) -> str:
+    raw = (full_text or "").strip()
+    if not raw:
+        return ""
+
+    text = raw
+    lowered = text.lower()
+    known_prefixes = (
+        "full document processed:",
+        "academic text extracted:",
+    )
+    for prefix in known_prefixes:
+        if lowered.startswith(prefix):
+            text = text[len(prefix) :].strip()
+            lowered = text.lower()
+            break
+
+    head = _normalize_ws(text)[:1800]
+    if not head:
+        return ""
+
+    cut_idx = len(head)
+    lower_head = head.lower()
+    for marker in TITLE_TRIM_MARKERS:
+        idx = lower_head.find(marker)
+        if idx > 0:
+            cut_idx = min(cut_idx, idx)
+    head = head[:cut_idx]
+    lower_head = head.lower()
+
+    for marker in TITLE_METADATA_MARKERS:
+        idx = lower_head.find(marker)
+        if idx > 20:
+            head = head[:idx]
+            lower_head = head.lower()
+
+    author_star = re.search(r"\s+[A-Z][a-z]{1,20}\s+[A-Z][a-z]{1,20}\s*[*∗]", head)
+    if author_star and author_star.start() > 10:
+        head = head[: author_star.start()]
+
+    candidate = head.strip(" -–—:;|,.")
+    if _looks_like_valid_title(candidate):
+        return candidate
+
+    # Fallback: check early lines and pick the first valid title-like line.
+    for line in text.splitlines()[:20]:
+        line_candidate = _normalize_ws(line).strip(" -–—:;|,.")
+        if _looks_like_valid_title(line_candidate):
+            return line_candidate
+    return ""
 
 
 def _to_sections(raw_text: str, structured_payload: Any = None) -> Dict[str, str]:
@@ -247,7 +343,7 @@ async def _parse_with_mcp(paper_path: str) -> PaperDocument:
                 session, resolved_tools["extract-citations"], {"file_path": paper_path}
             )
 
-    doc.title = Path(paper_path).stem
+    doc.title = _extract_title_from_full_text(full_text) or Path(paper_path).stem
     doc.abstract = abstract.strip()
     doc.full_text = full_text.strip()
     doc.sections = _to_sections(sections_text, sections_structured) or _to_sections(full_text)

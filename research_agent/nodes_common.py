@@ -1,10 +1,10 @@
-"""Compatibility export layer for node modules.
+"""Shared constants and helper functions for node implementations.
 
-This file keeps the original import surface stable:
-``from research_agent.nodes import ...`` continues to work after refactor.
+This module intentionally re-exports helper utilities from ``nodes_impl`` to keep
+behavior identical during the refactor while providing clearer module boundaries.
 """
 
-from research_agent.nodes_common import (
+from research_agent.nodes_impl import (
     AGENT_REQUIREMENTS,
     TOP_REQUIREMENTS_CONTRACT,
     CRITIC_HARD_GATES,
@@ -40,10 +40,6 @@ from research_agent.nodes_common import (
     _goal_ids_from_tool,
     _rewrite_rag_query,
 )
-from research_agent.nodes_ingest_planner import paper_ingest_node, paper_ingest_router, planner_node
-from research_agent.nodes_researcher import researcher_node
-from research_agent.nodes_writer import writer_node
-from research_agent.nodes_critic import critic_node, reflection_router
 
 __all__ = [
     "AGENT_REQUIREMENTS",
@@ -80,12 +76,5 @@ __all__ = [
     "_motivation_overweight_audit",
     "_goal_ids_from_tool",
     "_rewrite_rag_query",
-    "paper_ingest_node",
-    "paper_ingest_router",
-    "planner_node",
-    "researcher_node",
-    "writer_node",
-    "critic_node",
-    "reflection_router",
 ]
 

@@ -2,19 +2,25 @@
 
 一个基于 LangGraph 的研究型 Agent 项目，目标是围绕“教育模拟 + 多智能体 + 社会行为机制”完成从论文读取、研究规划、检索、写作到批判反思的闭环。
 
+当前支持两个并列功能模式：
+- `single_paper`：分析单篇论文（默认）
+- `topic_synthesis`：基于本地 RAG 语料库总结方向切入点
+
 当前版本重点是：
 - 通过 `pdf-reader-mcp` 读取 PDF 论文并结构化入状态。
 - 运行 `planner -> researcher -> writer -> critic` 的反思循环。
-- 预留 RAG 接口，后续接你自己的向量数据库。
+- 使用 `Chroma` 构建本地向量数据库，并通过 `rag.py` 做召回。
 
 ## 项目目标
 
 这个项目不是普通摘要器，而是“研究推进助手”：
 - 先细读当前输入论文。
-- 再结合论文内证据抽取与本地论文库相关内容（RAG 接口预留）。
+- 再结合论文内证据抽取与本地论文库相关内容（Chroma RAG）。
 - 最后输出可执行的研究判断与 future research insight。
 
 固定输出要求由 [agent要求.md](./agent要求.md) 驱动，`writer` 和 `critic` 都会显式消费该文档。
+
+架构主说明（建议先读）：[docs/architecture_progressive_guide.md](./docs/architecture_progressive_guide.md)
 
 ## 当前能力边界
 
@@ -25,7 +31,6 @@
 - ingest 失败时 fail-fast（不继续胡写）。
 
 未完全实现：
-- 真正的向量数据库 RAG（当前 [research_agent/rag.py](./research_agent/rag.py) 是占位实现）。
 - 长期记忆存储（目前以内存 state 为主）。
 
 ## 技术栈
@@ -34,6 +39,7 @@
 - LangChain / LangGraph
 - Pydantic v2
 - MCP Python SDK
+- Chroma + HuggingFace Embeddings（RAG）
 
 依赖定义见 [pyproject.toml](./pyproject.toml)。
 
@@ -44,6 +50,7 @@ Lygent/
 ├─ auto_researcher.py                # CLI 入口：传入论文路径并启动 workflow
 ├─ agent要求.md                      # 最终输出规范（writer/critic 的核心约束）
 ├─ docs/
+│  ├─ architecture_progressive_guide.md  # 架构主文档（全局->局部，agent 渐进式阅读）
 │  └─ pdf_reader_mcp_setup.md        # MCP 启动与排错文档
 ├─ mcps/
 │  └─ pdf-reader-mcp/                # 本地 PDF MCP server
@@ -52,9 +59,15 @@ Lygent/
    ├─ state.py                       # AgentState 定义与初始状态
    ├─ schemas.py                     # Planner/Critic 结构化输出 schema
    ├─ paper_parser.py                # MCP client + 解析适配层（核心）
-   ├─ rag.py                         # RAG 接口占位（后续接向量库）
+   ├─ rag.py                         # Chroma RAG 入库与检索
    ├─ tools.py                       # researcher 可调用的 PDF-MCP 工具
-   ├─ nodes.py                       # paper_ingest/planner/researcher/writer/critic
+   ├─ nodes.py                       # 兼容导出层（保持旧导入路径）
+   ├─ nodes_common.py                # 公共 helper / 门槛工具函数
+   ├─ nodes_ingest_planner.py        # ingest + planner
+   ├─ nodes_researcher.py            # researcher(ReAct)
+   ├─ nodes_writer.py                # writer
+   ├─ nodes_critic.py                # critic + reflection_router
+   ├─ nodes_impl.py                  # 节点实现主文件（重构后实现层）
    └─ workflow.py                    # LangGraph 编排与路由
 ```
 
@@ -109,10 +122,16 @@ flowchart LR
 
 [research_agent/nodes.py](./research_agent/nodes.py)
 
+当前采用“模块拆分 + 兼容导出”：
+- `nodes.py` 只负责兼容导出（`workflow` 仍按旧路径导入）
+- 各节点按职责拆分到 `nodes_ingest_planner.py / nodes_researcher.py / nodes_writer.py / nodes_critic.py`
+- `nodes_common.py` 存放通用 helper
+
+业务角色不变：
 - `paper_ingest_node`：读 PDF 并写回 state
 - `planner_node`：基于当前论文拆分 3-4 步计划
-- `researcher_node`：调用 PDF-MCP 工具提取论文证据 + RAG 占位召回
-  - 仅将成功工具输出写入 `documents` 作为证据池，工具错误/空内容不会进入证据文档
+- `researcher_node`：调用 PDF-MCP 工具提取论文证据 + Chroma RAG 召回
+  - 仅将成功工具输出写入证据池，工具错误/空内容不会进入证据文档
 - `writer_node`：按 `agent要求.md` 生成研究分析草稿
 - `critic_node`：结构化审稿并决定下一跳
 
@@ -150,6 +169,11 @@ PDF_PARSE_TIMEOUT_SEC=60
 # 可选
 MAX_REVISIONS=2
 RAG_TOP_K=5
+RAG_CHUNK_SIZE=1200
+RAG_CHUNK_OVERLAP=200
+VECTOR_DB_DIR=./data/vector_db
+VECTOR_DB_COLLECTION=papers
+EMBEDDING_MODEL=BAAI/bge-m3
 ```
 
 ### 3) 启动 PDF MCP server
@@ -169,6 +193,23 @@ cd /Users/a/Documents/Program/Lygent
 说明：
 - 当前 CLI 采用“位置参数传论文路径”。
 - `--query` 仍可选，用于覆盖默认研究问题。
+- `--mode` 可选：
+  - `single_paper`（默认）：必须传 `paper_path`
+  - `topic_synthesis`：可不传 `paper_path`
+
+单篇分析示例：
+```bash
+.venv/bin/python auto_researcher.py "/absolute/path/to/paper.pdf" \
+  --mode single_paper \
+  --query "请分析这篇论文并结合我的研究方向推进研究"
+```
+
+方向综述示例（基于 RAG 语料库）：
+```bash
+.venv/bin/python auto_researcher.py \
+  --mode topic_synthesis \
+  --query "请基于RAG中的所有文章总结agent simulation方向的主要论文切入点"
+```
 
 ## 常见问题排查
 
@@ -198,24 +239,53 @@ env -u all_proxy -u http_proxy -u https_proxy NO_PROXY=localhost,127.0.0.1 \
 
 ## RAG 与数据库接入点
 
-当前 RAG 是占位实现，入口在：
+当前 RAG 已落地到 Chroma，入口在：
 - [research_agent/rag.py](./research_agent/rag.py)
 
-你后续只需实现：
+核心函数：
+- `upsert_paper_to_vector_db(...)`：将论文切块后写入 Chroma
 - `retrieve_related_papers(...)`：向量检索返回相关文献片段
-- `upsert_paper_to_vector_db(...)`：将论文写入向量库
 
-并保持 `researcher_node` 现有调用方式不变即可完成平滑接入。
+### 批量入库工具（调用 pdf-reader-mcp）
+
+脚本：`scripts/db_manager.py`  
+功能：统一的 Chroma 管理入口（`ingest/search/list/stats/delete/clear`），支持本地 PDF、目录、URL、txt 列表自动解析入库。
+
+先启动 MCP：
+```bash
+cd /Users/a/Documents/Program/Lygent/mcps/pdf-reader-mcp
+uv run pdf-reader
+```
+
+再执行入库：
+```bash
+cd /Users/a/Documents/Program/Lygent
+.venv/bin/python scripts/db_manager.py ingest \
+  "/absolute/path/to/paper1.pdf" \
+  "https://arxiv.org/pdf/1706.03762.pdf"
+```
+
+目录批量入库：
+```bash
+.venv/bin/python scripts/db_manager.py ingest "/absolute/path/to/pdf_dir" --recursive
+```
+
+入库后检索验证：
+```bash
+.venv/bin/python scripts/db_manager.py ingest "/absolute/path/to/pdf_dir" --recursive \
+  --query "multi-agent education simulation" --top-k 5
+```
 
 ## 开发建议（下一步）
 
 建议按以下顺序继续：
-1. 先把 `rag.py` 接上真实向量库（pgvector 或你偏好的 DB）。
-2. 将 `paper_parser` 拆为多 MCP adapter（每个 MCP 一个 client 文件）。
-3. 在 `critic` 增加更细粒度评分字段（证据密度、迁移价值、实验有效性）。
-4. 增加单元测试与集成测试（重点覆盖 ingest 失败路径与反思路由）。
+1. 将 `paper_parser` 拆为多 MCP adapter（每个 MCP 一个 client 文件）。
+2. 在 `critic` 增加更细粒度评分字段（证据密度、迁移价值、实验有效性）。
+3. 增加单元测试与集成测试（重点覆盖 ingest 失败路径与反思路由）。
+4. 根据你需求可替换 Chroma 为 pgvector/sqlite-vec，保持 `rag.py` 接口不变。
 
 ## 参考文档
 
+- 架构主文档（全局->局部）：[docs/architecture_progressive_guide.md](./docs/architecture_progressive_guide.md)
 - PDF MCP 安装与运行：[docs/pdf_reader_mcp_setup.md](./docs/pdf_reader_mcp_setup.md)
 - 输出规范与研究目标：[agent要求.md](./agent要求.md)
